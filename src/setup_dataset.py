@@ -21,22 +21,38 @@ DATASET_MAP = {
             "yawn":    "yawn",
             "no yawn": "no_yawn",
         },
-    },
-    "eye_clf": {
-        "source_dir": DATASET_DIR / "eye_dataset",
-        "classes": {
-            "closed": "closed",
-            "open":   "open",
-        },
-    },
+    }
 }
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+MIN_IMAGES_PER_CLASS = 20
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def is_image(path: Path) -> bool:
+    """True if path is an image file and NOT a dotfile."""
+    return (path.is_file()
+            and path.suffix.lower() in IMG_EXTS
+            and not path.name.startswith("."))
+
+
 def gather_images(folder: Path) -> list[Path]:
-    return sorted([p for p in folder.iterdir() if p.suffix.lower() in IMG_EXTS])
+    return sorted([p for p in folder.iterdir() if is_image(p)])
+
+
+def remove_dotfiles(root: Path) -> int:
+    """Recursively delete dotfiles (.DS_Store etc.) under root. Returns count."""
+    if not root.exists():
+        return 0
+    count = 0
+    for path in root.rglob(".*"):
+        if path.is_file():
+            try:
+                path.unlink()
+                count += 1
+            except OSError:
+                pass
+    return count
 
 
 def split_and_copy(images: list[Path], splits: dict[str, Path], seed: int = SEED):
@@ -66,6 +82,18 @@ def main():
     print("  Fatigue Detection — Dataset Setup")
     print("=" * 60)
 
+    # ── Pre-clean dotfiles from source + previous processed dirs ──────────────
+    cleaned = 0
+    for path in (DATASET_DIR,):
+        cleaned += remove_dotfiles(path)
+    if cleaned:
+        print(f"\n  Cleaned {cleaned} dotfiles (.DS_Store etc.) from dataset/")
+
+    # ── Wipe stale processed/ so re-runs don't accumulate ─────────────────────
+    if PROCESSED.exists():
+        shutil.rmtree(PROCESSED)
+        print(f"  Cleared previous processed/ tree")
+
     total_copied = 0
 
     for clf_name, config in DATASET_MAP.items():
@@ -86,8 +114,8 @@ def main():
             images = gather_images(src_dir)
             print(f"\n  Class '{src_cls}' → '{dst_cls}'  ({len(images)} images)")
 
-            if len(images) < 20:
-                print(f"  ⚠  Too few images ({len(images)}). Skipping.")
+            if len(images) < MIN_IMAGES_PER_CLASS:
+                print(f"  ⚠  Too few images ({len(images)} < {MIN_IMAGES_PER_CLASS}). Skipping.")
                 continue
 
             splits = {
@@ -112,10 +140,12 @@ def main():
             split_dir = clf_dir / split
             if not split_dir.exists():
                 continue
-            count = sum(1 for p in split_dir.rglob("*") if p.suffix.lower() in IMG_EXTS)
+            count = sum(1 for p in split_dir.rglob("*") if is_image(p))
             print(f"    {split:5s}/  ({count} images)")
             for cls_dir in sorted(split_dir.iterdir()):
-                n = len([p for p in cls_dir.iterdir() if p.suffix.lower() in IMG_EXTS])
+                if cls_dir.name.startswith(".") or not cls_dir.is_dir():
+                    continue
+                n = sum(1 for p in cls_dir.iterdir() if is_image(p))
                 print(f"      {cls_dir.name}/  ({n})")
 
     print()

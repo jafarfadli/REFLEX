@@ -21,7 +21,7 @@ NUM_WORKERS = 2
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CLASSIFIERS = ["yawn_clf", "eye_clf"]
+CLASSIFIERS = ["yawn_clf"]
 
 # ── Transforms ────────────────────────────────────────────────────────────────
 _MEAN = [0.485, 0.456, 0.406]
@@ -112,7 +112,6 @@ def eval_epoch(model, loader, criterion):
 
 
 # ── Main training routine ─────────────────────────────────────────────────────
-
 def train_classifier(clf_name: str, epochs: int = EPOCHS):
     data_dir = PROCESSED_DIR / clf_name
     if not data_dir.exists():
@@ -142,7 +141,7 @@ def train_classifier(clf_name: str, epochs: int = EPOCHS):
         optimizer, mode="min", patience=3, factor=0.5
     )
     criterion = nn.CrossEntropyLoss()
-    scaler    = torch.cuda.amp.GradScaler() if DEVICE.type == "cuda" else None
+    scaler    = torch.amp.GradScaler() if DEVICE.type == "cuda" else None
 
     best_val_acc    = 0.0
     best_model_path = MODELS_DIR / f"{clf_name}.pt"
