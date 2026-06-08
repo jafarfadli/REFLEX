@@ -1,4 +1,7 @@
 import argparse
+import json
+import platform
+import subprocess
 import sys
 import time
 from collections import deque
@@ -15,34 +18,29 @@ import mediapipe as mp
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
 MODELS_DIR = BASE_DIR / "models"
+CALIB_FILE = BASE_DIR / "calibration.json"
 
 # ── Detection config ──────────────────────────────────────────────────────────
 ALERT_THRESHOLD       = 0.65
 
-# Fusion weights
 W_EYE                 = 0.35
 W_PERCLOS             = 0.15
 W_YAWN                = 0.20
 W_NOD                 = 0.30
 
-# Eye closure (EAR-based)
-EYE_MIN_DURATION      = 0.4    # sustained closed ≥ this → microsleep
+EYE_MIN_DURATION      = 0.4
 PERCLOS_WINDOW_SEC    = 60
-PERCLOS_THRESHOLD     = 0.15   # 15% drowsy threshold (industry standard)
-EAR_FALLBACK_THRESHOLD = 0.25  # used if --skip-calib
+PERCLOS_THRESHOLD     = 0.15
+EAR_FALLBACK_THRESHOLD = 0.25
 
-# Calibration
-CALIB_OPEN_SEC         = 5.0   # seconds capturing OPEN baseline (also pitch)
-CALIB_CLOSED_SEC       = 5.0   # seconds capturing CLOSED baseline
+CALIB_OPEN_SEC         = 5.0
+CALIB_CLOSED_SEC       = 5.0
 CALIB_COUNTDOWN_SEC    = 3
 CALIB_MIN_SAMPLES      = 20
-CALIB_WARN_SPREAD      = 0.04  # warn if open-closed spread is below this
 
-# Yawn
 YAWN_CONF_THRESHOLD   = 0.70
 YAWN_MIN_DURATION     = 1.0
 
-# Nod
 NOD_THRESHOLD_DEG     = 12.0
 NOD_MIN_DURATION      = 0.8
 
@@ -51,7 +49,32 @@ FACE_CONF_MIN         = 0.40
 MOUTH_CROP_START      = 0.55
 IMG_SIZE              = 224
 
+# Audio
+ALERT_SOUND_INTERVAL  = 2.5    # repeat alarm every X seconds while alert
+
+# Sound type identifiers (mapped to OS-specific sounds in play_sound)
+SOUND_PHASE_DONE  = "phase_done"   # short chime — end of Phase 1
+SOUND_CALIB_DONE  = "calib_done"   # distinct — end of calibration (eyes closed!)
+SOUND_ALERT       = "alert"        # sharp alarm — wake driver
+
+# OS-specific sound files (macOS / Linux). Windows uses winsound flags.
+_MACOS_SOUNDS = {
+    SOUND_PHASE_DONE: "/System/Library/Sounds/Glass.aiff",
+    SOUND_CALIB_DONE: "/System/Library/Sounds/Hero.aiff",
+    SOUND_ALERT:      "/System/Library/Sounds/Sosumi.aiff",
+}
+_LINUX_SOUNDS = {
+    SOUND_PHASE_DONE: "/usr/share/sounds/freedesktop/stereo/bell.oga",
+    SOUND_CALIB_DONE: "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    SOUND_ALERT:      "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
+}
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ── State constants ───────────────────────────────────────────────────────────
+STATE_STANDBY     = "STANDBY"
+STATE_CALIBRATING = "CALIBRATING"
+STATE_PREDICTING  = "PREDICTING"
 
 # ── Color palette (BGR) ───────────────────────────────────────────────────────
 COLOR_OK      = (40, 200, 80)
@@ -60,10 +83,11 @@ COLOR_ALERT   = (0, 0, 220)
 COLOR_HUD     = (200, 200, 200)
 COLOR_OPEN    = (0, 255, 0)
 COLOR_CLOSED  = (0, 100, 255)
+COLOR_STANDBY = (180, 180, 180)
 
 WINDOW_NAME = "Fatigue Detection — V2X Prototype"
 
-# ── Head pose: 3D model + landmark indices ────────────────────────────────────
+# ── Landmarks ─────────────────────────────────────────────────────────────────
 FACE_3D_MODEL = np.array([
     [   0.0,   0.0,   0.0],
     [   0.0, -63.6, -12.5],
@@ -72,17 +96,102 @@ FACE_3D_MODEL = np.array([
     [ -28.9, -28.9, -24.1],
     [  28.9, -28.9, -24.1],
 ], dtype=np.float64)
-MP_POSE_IDS = [1, 152, 33, 263, 61, 291]
-
-# ── EAR landmarks ─────────────────────────────────────────────────────────────
-# Order: [outer_corner, upper1, upper2, inner_corner, lower1, lower2]
+MP_POSE_IDS   = [1, 152, 33, 263, 61, 291]
 LEFT_EYE_EAR  = [33,  159, 158, 133, 153, 145]
 RIGHT_EYE_EAR = [263, 386, 385, 362, 380, 373]
 
 
-# ── EAR helpers ───────────────────────────────────────────────────────────────
+# ── Audio helpers ─────────────────────────────────────────────────────────────
 
-def _single_eye_ear(landmarks, ids, fw, fh) -> float:
+IS_MACOS   = platform.system() == "Darwin"
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+
+AUDIO_ENABLED = True   # global, toggled by --no-audio flag
+
+
+def play_sound(sound_type: str):
+    """Non-blocking sound playback. Maps a sound type identifier
+    (SOUND_PHASE_DONE / SOUND_CALIB_DONE / SOUND_ALERT) to an OS-specific sound."""
+    if not AUDIO_ENABLED:
+        return
+    try:
+        if IS_MACOS:
+            path = _MACOS_SOUNDS.get(sound_type)
+            if path:
+                subprocess.Popen(["afplay", path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif IS_WINDOWS:
+            import winsound
+            # Three distinct system beeps so each cue is recognizable.
+            flag_map = {
+                SOUND_PHASE_DONE: winsound.MB_ICONASTERISK,     # info chime
+                SOUND_CALIB_DONE: winsound.MB_ICONEXCLAMATION,  # warning — distinct
+                SOUND_ALERT:      winsound.MB_ICONHAND,         # error — sharp alarm
+            }
+            winsound.MessageBeep(flag_map.get(sound_type, winsound.MB_OK))
+        elif IS_LINUX:
+            path = _LINUX_SOUNDS.get(sound_type)
+            if path:
+                try:
+                    subprocess.Popen(["paplay", path],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except FileNotFoundError:
+                    print("\a", end="", flush=True)
+    except Exception:
+        pass
+
+
+# ── Calibration persistence ───────────────────────────────────────────────────
+
+def save_calibration(ear_threshold: float, baseline_ear_open: float,
+                     baseline_pitch: float) -> bool:
+    """Persist calibration values to disk. Returns True on success."""
+    payload = {
+        "version":           1,
+        "ear_threshold":     float(ear_threshold),
+        "baseline_ear_open": float(baseline_ear_open),
+        "baseline_pitch":    float(baseline_pitch),
+        "saved_at":          time.strftime("%Y-%m-%d %H:%M:%S"),
+        "platform":          platform.system(),
+    }
+    try:
+        CALIB_FILE.write_text(json.dumps(payload, indent=2))
+        print(f"  Calibration saved → {CALIB_FILE.name}")
+        return True
+    except Exception as e:
+        print(f"  [WARN] Could not save calibration: {e}")
+        return False
+
+
+def load_calibration() -> dict | None:
+    """Load saved calibration. Returns dict with keys
+       {ear_threshold, baseline_ear_open, baseline_pitch, saved_at} or None."""
+    if not CALIB_FILE.exists():
+        return None
+    try:
+        data = json.loads(CALIB_FILE.read_text())
+        # Validate
+        ear_t  = float(data["ear_threshold"])
+        bo_ear = float(data["baseline_ear_open"])
+        b_pit  = float(data["baseline_pitch"])
+        if not (0.05 < ear_t < 0.50 and 0.10 < bo_ear < 0.60 and -45 < b_pit < 45):
+            print(f"  [WARN] Saved calibration values look invalid — ignoring.")
+            return None
+        return {
+            "ear_threshold":     ear_t,
+            "baseline_ear_open": bo_ear,
+            "baseline_pitch":    b_pit,
+            "saved_at":          data.get("saved_at", "unknown"),
+        }
+    except Exception as e:
+        print(f"  [WARN] Could not load calibration: {e}")
+        return None
+
+
+# ── Signal helpers (unchanged) ────────────────────────────────────────────────
+
+def _single_eye_ear(landmarks, ids, fw, fh):
     pts = np.array(
         [[landmarks[i].x * fw, landmarks[i].y * fh] for i in ids],
         dtype=np.float64,
@@ -92,16 +201,13 @@ def _single_eye_ear(landmarks, ids, fw, fh) -> float:
     return float(vert / (2.0 * horiz)) if horiz > 1e-6 else 0.0
 
 
-def compute_ear(landmarks, fw: int, fh: int) -> float:
-    """Average EAR across both eyes."""
+def compute_ear(landmarks, fw, fh):
     l = _single_eye_ear(landmarks, LEFT_EYE_EAR,  fw, fh)
     r = _single_eye_ear(landmarks, RIGHT_EYE_EAR, fw, fh)
     return (l + r) / 2.0
 
 
-# ── CNN helpers (yawn only) ───────────────────────────────────────────────────
-
-def get_transform() -> transforms.Compose:
+def get_transform():
     return transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -110,7 +216,7 @@ def get_transform() -> transforms.Compose:
     ])
 
 
-def load_cnn(model_path: Path):
+def load_cnn(model_path):
     ckpt = torch.load(model_path, map_location=DEVICE)
     classes = ckpt["classes"]
     model = models.mobilenet_v2(weights=None)
@@ -127,7 +233,7 @@ def load_cnn(model_path: Path):
 
 
 @torch.no_grad()
-def classify(model, classes: list, crop: np.ndarray, transform) -> tuple[str, float]:
+def classify(model, classes, crop, transform):
     if crop is None or crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 10:
         return "unknown", 0.0
     rgb    = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
@@ -137,24 +243,22 @@ def classify(model, classes: list, crop: np.ndarray, transform) -> tuple[str, fl
     return classes[idx], probs[idx].item()
 
 
-def positive_prob(label: str, conf: float, positive_class: str) -> float:
+def positive_prob(label, conf, positive_class):
     return conf if label == positive_class else 1.0 - conf
 
-
-# ── Frame helpers ─────────────────────────────────────────────────────────────
 
 def clamp_box(x1, y1, x2, y2, w, h):
     return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
 
 
-def mouth_crop(face_bgr: np.ndarray) -> np.ndarray | None:
+def mouth_crop(face_bgr):
     if face_bgr is None or face_bgr.size == 0:
         return None
     fh = face_bgr.shape[0]
     return face_bgr[int(fh * MOUTH_CROP_START):, :]
 
 
-def estimate_pitch(landmarks, fw: int, fh: int) -> float | None:
+def estimate_pitch(landmarks, fw, fh):
     image_pts = np.array(
         [[landmarks[i].x * fw, landmarks[i].y * fh] for i in MP_POSE_IDS],
         dtype=np.float64,
@@ -166,14 +270,10 @@ def estimate_pitch(landmarks, fw: int, fh: int) -> float | None:
         [  0.0,   0.0,      1.0],
     ], dtype=np.float64)
     dist_coeffs = np.zeros((4, 1))
-
-    ok, rvec, _ = cv2.solvePnP(
-        FACE_3D_MODEL, image_pts, cam_matrix, dist_coeffs,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
+    ok, rvec, _ = cv2.solvePnP(FACE_3D_MODEL, image_pts, cam_matrix, dist_coeffs,
+                                flags=cv2.SOLVEPNP_ITERATIVE)
     if not ok:
         return None
-
     rmat, _ = cv2.Rodrigues(rvec)
     sy = float(np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2))
     if sy < 1e-6:
@@ -188,10 +288,89 @@ def estimate_pitch(landmarks, fw: int, fh: int) -> float | None:
     return pitch_deg
 
 
-# ── Calibration phase ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE: STANDBY
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _show_countdown(cap, prompt: str, color: tuple, seconds: int) -> bool:
-    """Returns False if user pressed q."""
+def run_standby(cap, has_calibration: bool, baseline_info: dict | None) -> str:
+    """
+    Returns next state: 'CALIBRATE', 'PREDICT', or 'QUIT'.
+    """
+    print("\n  ── STANDBY ──")
+    print("     Press  c  to calibrate")
+    if has_calibration:
+        print("     Press  p  to start predicting (using existing calibration)")
+    print("     Press  q  to quit\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        h, w = frame.shape[:2]
+
+        # Dim overlay
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(frame, 0.65, overlay, 0.35, 0)
+
+        # Top banner
+        cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
+        cv2.putText(frame, "STANDBY", (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, COLOR_HUD, 3, cv2.LINE_AA)
+        cv2.putText(frame, "Camera live  ·  no detection active",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (160, 160, 160), 1, cv2.LINE_AA)
+
+        # Instructions
+        y0 = h - 130
+        cv2.rectangle(frame, (0, y0), (w, h), (0, 0, 0), -1)
+        cv2.putText(frame, "[c]  Calibrate", (20, y0 + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 220, 255), 2, cv2.LINE_AA)
+        if has_calibration:
+            cv2.putText(frame, "[p]  Predict (use existing calibration)",
+                        (20, y0 + 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 220, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, "[q]  Quit", (20, y0 + 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 220, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "[q]  Quit", (20, y0 + 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 220, 255), 2, cv2.LINE_AA)
+
+        # Calibration status (right side)
+        if has_calibration and baseline_info:
+            cv2.putText(frame,
+                        f"EAR thr: {baseline_info['ear_threshold']:.3f}",
+                        (w - 270, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(frame,
+                        f"Pitch base: {baseline_info['baseline_pitch']:+.1f}°",
+                        (w - 270, y0 + 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+            saved_at = baseline_info.get("saved_at", "")
+            if saved_at:
+                cv2.putText(frame,
+                            f"saved: {saved_at}",
+                            (w - 270, y0 + 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+        else:
+            cv2.putText(frame, "no calibration", (w - 200, y0 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 100, 100), 1, cv2.LINE_AA)
+
+        cv2.imshow(WINDOW_NAME, frame)
+        key = cv2.waitKey(30) & 0xFF
+        if key == ord("q"):
+            return "QUIT"
+        if key == ord("c"):
+            return "CALIBRATE"
+        if key == ord("p") and has_calibration:
+            return "PREDICT"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE: CALIBRATING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _show_countdown(cap, prompt, color, seconds):
     for sec in range(seconds, 0, -1):
         end_t = time.time() + 1.0
         while time.time() < end_t:
@@ -210,9 +389,7 @@ def _show_countdown(cap, prompt: str, color: tuple, seconds: int) -> bool:
     return True
 
 
-def _capture_phase(cap, face_mesh, prompt: str, color: tuple,
-                   duration: float, want_pitch: bool):
-    """Capture EAR (and optionally pitch) values over the duration."""
+def _capture_phase(cap, face_mesh, prompt, color, duration, want_pitch):
     ear_values   = []
     pitch_values = []
     start_t      = time.time()
@@ -222,7 +399,6 @@ def _capture_phase(cap, face_mesh, prompt: str, color: tuple,
         if not ret:
             continue
         h, w = frame.shape[:2]
-
         results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         ear_now = None
         if results.multi_face_landmarks:
@@ -234,7 +410,6 @@ def _capture_phase(cap, face_mesh, prompt: str, color: tuple,
                 if p is not None:
                     pitch_values.append(p)
 
-        # Overlay
         elapsed   = time.time() - start_t
         remaining = duration - elapsed
         cv2.rectangle(frame, (0, 0), (w, 130), (0, 0, 0), -1)
@@ -242,90 +417,76 @@ def _capture_phase(cap, face_mesh, prompt: str, color: tuple,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2, cv2.LINE_AA)
         ear_str = f"EAR = {ear_now:.4f}" if ear_now is not None else "no face"
         cv2.putText(frame,
-                    f"{remaining:4.1f}s left   |   {ear_str}   |   samples = {len(ear_values)}",
+                    f"{remaining:4.1f}s left | {ear_str} | samples = {len(ear_values)}",
                     (20, 95),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-        # Progress bar
         bar_w = int(w * (elapsed / duration))
         cv2.rectangle(frame, (0, 130), (bar_w, 136), color, -1)
-
         cv2.imshow(WINDOW_NAME, frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
-
     return ear_values, pitch_values
 
 
-def run_calibration(cap, face_mesh) -> tuple[float, float, float] | None:
+def run_calibration(cap, face_mesh):
     """
-    Runs two-phase calibration. Returns:
-      (ear_threshold, baseline_open_ear, baseline_pitch)
-    or None if aborted/failed.
+    Two-phase calibration with audio cues.
+    Returns (ear_threshold, baseline_ear_open, baseline_pitch) or None if aborted.
     """
-    print("\n  ── CALIBRATION ────────────────────────────────────────")
-    print("     Two phases, ~10 seconds total.\n")
+    print("\n  ── CALIBRATION ──")
+    print("     Phase 1: eyes OPEN  (5s)")
+    print("     Phase 2: eyes CLOSED (5s)\n")
 
-    # Phase 1: OPEN eyes (also gather pitch baseline)
+    # Phase 1
     if not _show_countdown(cap, "look at camera with eyes OPEN",
-                           COLOR_OPEN, CALIB_COUNTDOWN_SEC):
+                            COLOR_OPEN, CALIB_COUNTDOWN_SEC):
         return None
-    print("     Phase 1/2: capturing OPEN baseline (eyes + pitch)...")
+    print("     Phase 1/2: capturing OPEN baseline...")
     open_ears, pitch_vals = _capture_phase(
-        cap, face_mesh,
-        prompt="OPEN your eyes normally",
-        color=COLOR_OPEN,
-        duration=CALIB_OPEN_SEC,
-        want_pitch=True,
+        cap, face_mesh, "OPEN your eyes normally", COLOR_OPEN,
+        CALIB_OPEN_SEC, want_pitch=True,
     )
 
-    # Phase 2: CLOSED eyes
+    # Sound cue: Phase 1 done (user can see screen, but reinforces transition)
+    play_sound(SOUND_PHASE_DONE)
+
+    # Phase 2 — user will close eyes, can't see screen!
     if not _show_countdown(cap, "CLOSE your eyes fully",
-                           COLOR_CLOSED, CALIB_COUNTDOWN_SEC):
+                            COLOR_CLOSED, CALIB_COUNTDOWN_SEC):
         return None
     print("     Phase 2/2: capturing CLOSED baseline...")
     closed_ears, _ = _capture_phase(
-        cap, face_mesh,
-        prompt="CLOSE your eyes fully (keep them shut)",
-        color=COLOR_CLOSED,
-        duration=CALIB_CLOSED_SEC,
-        want_pitch=False,
+        cap, face_mesh, "CLOSE your eyes fully (keep them shut)", COLOR_CLOSED,
+        CALIB_CLOSED_SEC, want_pitch=False,
     )
+
+    # Sound cue: CALIBRATION COMPLETE — distinct triumphant sound,
+    # critical because user's eyes are closed.
+    play_sound(SOUND_CALIB_DONE)
 
     # Sanity
     if len(open_ears) < CALIB_MIN_SAMPLES or len(closed_ears) < CALIB_MIN_SAMPLES:
-        print(f"     [ERROR] Not enough samples (open={len(open_ears)}, closed={len(closed_ears)}).")
+        print(f"     [ERROR] Not enough samples.")
         return None
-    if len(pitch_vals) < CALIB_MIN_SAMPLES:
-        print(f"     [WARN] Few pitch samples ({len(pitch_vals)}). Nod detection may be unstable.")
 
-    # Compute thresholds
     open_med   = float(np.median(open_ears))
     closed_med = float(np.median(closed_ears))
-    spread     = open_med - closed_med
-    threshold  = (open_med + closed_med) / 2.0
+    threshold  = (open_med * 1 + closed_med * 2) / 3
     pitch_med  = float(np.median(pitch_vals)) if pitch_vals else 0.0
 
-    print(f"\n     OPEN  EAR median   : {open_med:.4f}  (n={len(open_ears)})")
-    print(f"     CLOSED EAR median  : {closed_med:.4f}  (n={len(closed_ears)})")
-    print(f"     Spread             : {spread:.4f}")
-    print(f"     EAR threshold      : {threshold:.4f}")
-    print(f"     Pitch baseline     : {pitch_med:+.2f}°")
-
-    if spread < CALIB_WARN_SPREAD:
-        print(f"     ⚠  Spread is very small. Eye detection may misfire.")
-
+    print(f"\n     EAR open/closed/threshold : {open_med:.4f} / {closed_med:.4f} / {threshold:.4f}")
+    print(f"     Pitch baseline             : {pitch_med:+.2f}°\n")
     return threshold, open_med, pitch_med
 
 
-# ── Overlay drawing ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE: PREDICTING
+# ══════════════════════════════════════════════════════════════════════════════
 
-def draw_overlay(frame, bbox,
-                 ear_val, ear_threshold, is_eyes_closed,
-                 yawn_label, yawn_conf, score,
-                 yawn_count, nod_count, closure_count,
+def draw_overlay(frame, bbox, ear_val, ear_threshold, is_eyes_closed,
+                 yawn_label, yawn_conf, score, yawn_count, nod_count, closure_count,
                  perclos, pitch_str, alert):
     x1, y1, x2, y2 = bbox
-
     if alert:
         color = COLOR_ALERT
     elif score > 0.45:
@@ -334,7 +495,6 @@ def draw_overlay(frame, bbox,
         color = COLOR_OK
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
     bar_w  = x2 - x1
     filled = int(bar_w * min(score, 1.0))
     cv2.rectangle(frame, (x1, y2 + 2), (x2, y2 + 8), (60, 60, 60), -1)
@@ -364,40 +524,251 @@ def draw_overlay(frame, bbox,
                     (255, 255, 255), 2, cv2.LINE_AA)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+def run_prediction(cap, face_mesh, yolo, yaw_model, yaw_cls, transform,
+                   ear_threshold, baseline_ear_open, baseline_pitch,
+                   alert_threshold, no_display):
+    """
+    Main detection loop with audio alerts.
+    Returns: 'STANDBY', 'RECALIBRATE', or 'QUIT'.
+    """
+    print("\n  ── PREDICTING ──")
+    print("     [s] back to standby   [r] re-calibrate   [q] quit\n")
+
+    # State
+    closure_streak_start    = None
+    closure_already_counted = False
+    closure_events          = deque()
+    perclos_history         = deque()
+
+    yawn_streak_start    = None
+    yawn_already_counted = False
+    yawn_times           = deque()
+
+    nod_streak_start    = None
+    nod_already_counted = False
+    nod_times           = deque()
+
+    last_alert_sound_t = 0.0
+    fps_counter, fps_t0, fps = 0, time.time(), 0.0
+
+    print(f"  {'Status':<11} {'Score':>6}  {'EAR':>14}  {'Yawn':>14}  "
+          f"{'Pitch':>7}  {'PCL':>5}  {'Y/30':>4}  {'N/30':>4}  {'C/30':>4}  {'FPS':>5}")
+    print("  " + "-" * 95)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        now = time.time()
+        fps_counter += 1
+        if fps_counter >= 15:
+            fps = fps_counter / (now - fps_t0); fps_counter = 0; fps_t0 = now
+
+        # Prune
+        while yawn_times      and now - yawn_times[0]         > ROLLING_WINDOW_SEC:
+            yawn_times.popleft()
+        while nod_times       and now - nod_times[0]          > ROLLING_WINDOW_SEC:
+            nod_times.popleft()
+        while closure_events  and now - closure_events[0]     > ROLLING_WINDOW_SEC:
+            closure_events.popleft()
+        while perclos_history and now - perclos_history[0][0] > PERCLOS_WINDOW_SEC:
+            perclos_history.popleft()
+
+        # YOLO
+        results    = yolo(frame, verbose=False, conf=FACE_CONF_MIN, imgsz=640)
+        detections = results[0].boxes
+
+        if detections is None or len(detections) == 0:
+            print(f"\r  {'[no face]':<11} {'—':>6}  {'—':>14}  {'—':>14}  "
+                  f"{'—':>7}  {'—':>5}  {'—':>4}  {'—':>4}  {'—':>4}  {fps:>4.1f}fps",
+                  end="", flush=True)
+            if not no_display:
+                cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (0, 0, 0), -1)
+                cv2.putText(frame, f"PREDICTING  ·  no face  ·  [s]tandby [r]ecalib [q]uit",
+                            (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_HUD, 1)
+                cv2.imshow(WINDOW_NAME, frame)
+                k = cv2.waitKey(1) & 0xFF
+                if k == ord("q"): return "QUIT"
+                if k == ord("s"): return "STANDBY"
+                if k == ord("r"): return "RECALIBRATE"
+            continue
+
+        boxes = detections.xyxy.cpu().numpy()
+        areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+        best  = int(np.argmax(areas))
+        x1, y1, x2, y2 = map(int, boxes[best])
+        fh, fw = frame.shape[:2]
+        x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, fw, fh)
+        face_crop = frame[y1:y2, x1:x2]
+        m_crop    = mouth_crop(face_crop)
+
+        # MediaPipe
+        mp_results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        ear_val       = None
+        current_pitch = None
+        if mp_results.multi_face_landmarks:
+            lm = mp_results.multi_face_landmarks[0].landmark
+            ear_val       = compute_ear(lm, fw, fh)
+            current_pitch = estimate_pitch(lm, fw, fh)
+
+        is_eyes_closed = (ear_val is not None and ear_val < ear_threshold)
+
+        if is_eyes_closed:
+            if closure_streak_start is None:
+                closure_streak_start = now; closure_already_counted = False
+            if (not closure_already_counted
+                    and now - closure_streak_start >= EYE_MIN_DURATION):
+                closure_events.append(now); closure_already_counted = True
+        else:
+            closure_streak_start = None; closure_already_counted = False
+        closure_count = len(closure_events)
+
+        if ear_val is not None:
+            perclos_history.append((now, is_eyes_closed))
+        perclos = (sum(1 for _, c in perclos_history if c) / len(perclos_history)
+                   if perclos_history else 0.0)
+
+        if ear_val is None:
+            eye_signal = 0.0
+        elif baseline_ear_open > ear_threshold:
+            eye_signal = float(np.clip(
+                (baseline_ear_open - ear_val) / (baseline_ear_open - ear_threshold),
+                0.0, 1.0,
+            ))
+        else:
+            eye_signal = 1.0 if is_eyes_closed else 0.0
+
+        yaw_label, yaw_conf = classify(yaw_model, yaw_cls, m_crop, transform)
+        yaw_prob = positive_prob(yaw_label, yaw_conf, "yawn")
+
+        is_mouth_open = yaw_label == "yawn" and yaw_conf >= YAWN_CONF_THRESHOLD
+        if is_mouth_open:
+            if yawn_streak_start is None:
+                yawn_streak_start = now; yawn_already_counted = False
+            if (not yawn_already_counted
+                    and now - yawn_streak_start >= YAWN_MIN_DURATION):
+                yawn_times.append(now); yawn_already_counted = True
+        else:
+            yawn_streak_start = None; yawn_already_counted = False
+        yawn_count = len(yawn_times)
+
+        nod_intensity = 0.0
+        is_head_down  = False
+        pitch_offset  = 0.0
+        if current_pitch is not None:
+            pitch_offset  = current_pitch - baseline_pitch
+            nod_intensity = min(abs(pitch_offset) / NOD_THRESHOLD_DEG, 1.0)
+            is_head_down  = abs(pitch_offset) >= NOD_THRESHOLD_DEG
+
+        if is_head_down:
+            if nod_streak_start is None:
+                nod_streak_start = now; nod_already_counted = False
+            if (not nod_already_counted
+                    and now - nod_streak_start >= NOD_MIN_DURATION):
+                nod_times.append(now); nod_already_counted = True
+        else:
+            nod_streak_start = None; nod_already_counted = False
+        nod_count = len(nod_times)
+
+        perclos_signal = min(perclos / PERCLOS_THRESHOLD, 1.0)
+        score = (W_EYE     * eye_signal
+                 + W_PERCLOS * perclos_signal
+                 + W_YAWN    * yaw_prob
+                 + W_NOD     * nod_intensity)
+        alert = score >= alert_threshold
+
+        # ── Audible alarm (repeating while alert active) ──────────────────────
+        if alert and (now - last_alert_sound_t) >= ALERT_SOUND_INTERVAL:
+            play_sound(SOUND_ALERT)
+            last_alert_sound_t = now
+
+        # Terminal
+        pitch_str = f"{pitch_offset:+5.1f}°"
+        ear_str   = f"{ear_val:.3f}" if ear_val is not None else "—"
+        eye_disp  = "CLOSED" if is_eyes_closed else "OPEN"
+        status    = "🚨 ALERT  " if alert else "✅ OK     "
+        print(
+            f"\r  {status:<11} {score:>6.3f}  "
+            f"{ear_str:>5}/{eye_disp:>6}  "
+            f"{yaw_label:>8}({yaw_conf:.2f})  "
+            f"{pitch_str:>7}  "
+            f"{perclos*100:>4.1f}%  "
+            f"{yawn_count:>4d}  {nod_count:>4d}  {closure_count:>4d}  "
+            f"{fps:>4.1f}fps",
+            end="", flush=True,
+        )
+
+        if alert:
+            ts = time.strftime("%H:%M:%S")
+            print(
+                f"\n  ┌─ V2X EVENT [{ts}] ────────────────────────────────────\n"
+                f"  │  fatigue_score : {score:.4f}\n"
+                f"  │  eye_signal    : {eye_signal:.4f}  (closed={is_eyes_closed})\n"
+                f"  │  perclos       : {perclos*100:.1f}%\n"
+                f"  │  yawn_conf     : {yaw_label} @ {yaw_conf:.4f}\n"
+                f"  │  pitch_offset  : {pitch_offset:+.2f}°\n"
+                f"  └─ ACTION        : BROADCAST + AUDIBLE ALARM"
+            )
+
+        if not no_display:
+            draw_overlay(frame, (x1, y1, x2, y2),
+                         ear_val, ear_threshold, is_eyes_closed,
+                         yaw_label, yaw_conf,
+                         score, yawn_count, nod_count, closure_count,
+                         perclos, pitch_str, alert)
+            cv2.putText(frame,
+                        f"PREDICTING  ·  [s]tandby [r]ecalib [q]uit  ·  FPS:{fps:.1f}",
+                        (10, fh - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_HUD, 1)
+            cv2.imshow(WINDOW_NAME, frame)
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord("q"): return "QUIT"
+            if k == ord("s"): return "STANDBY"
+            if k == ord("r"): return "RECALIBRATE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN (state machine)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global AUDIO_ENABLED
+
     parser = argparse.ArgumentParser(description="Fatigue Detection — V2X Prototype")
-    parser.add_argument("--camera",        type=int,   default=0,                help="Webcam index")
-    parser.add_argument("--threshold",     type=float, default=ALERT_THRESHOLD,  help="Alert threshold [0-1]")
-    parser.add_argument("--no-display",    action="store_true",                  help="Disable OpenCV window")
-    parser.add_argument("--skip-calib",    action="store_true",                  help="Skip calibration (use fallback EAR threshold)")
-    parser.add_argument("--ear-threshold", type=float, default=EAR_FALLBACK_THRESHOLD,
-                        help="EAR threshold when --skip-calib (default: %(default)s)")
+    parser.add_argument("--camera",     type=int,   default=0)
+    parser.add_argument("--threshold",  type=float, default=ALERT_THRESHOLD)
+    parser.add_argument("--no-display", action="store_true")
+    parser.add_argument("--no-audio",   action="store_true",
+                        help="Disable all audio cues (sound + TTS)")
     args = parser.parse_args()
+
+    if args.no_audio:
+        AUDIO_ENABLED = False
 
     print(f"\n{'='*60}")
     print(f"  Fatigue Detection System  |  V2X Prototype")
     print(f"{'='*60}")
     print(f"  Device          : {DEVICE}")
     print(f"  Alert threshold : {args.threshold}")
+    print(f"  Audio cues      : {'enabled' if AUDIO_ENABLED else 'DISABLED'}")
+    print(f"  Platform        : {platform.system()}")
 
-    # ── Load yawn CNN ─────────────────────────────────────────────────────────
+    # Load yawn CNN
     yaw_path = MODELS_DIR / "yawn_clf.pt"
     if not yaw_path.exists():
-        print(f"\n  [ERROR] yawn_clf model not found: {yaw_path}")
-        print("          Run:  python train_cnn.py --clf yawn_clf  first.\n")
+        print(f"\n  [ERROR] yawn_clf model not found: {yaw_path}\n")
         sys.exit(1)
-
-    print("  Loading yawn CNN...")
+    print("\n  Loading yawn CNN...")
     yaw_model, yaw_cls = load_cnn(yaw_path)
-    print(f"    yawn_clf classes: {yaw_cls}")
 
-    # ── YOLO ──────────────────────────────────────────────────────────────────
+    # YOLO
     print("  Loading YOLO face detector...")
     try:
         from ultralytics import YOLO
-        yolo_path = MODELS_DIR / "yolo26n-face.pt"
+        yolo_path = BASE_DIR / "models" / "yolo26n-face.pt"
         if not yolo_path.exists():
             print(f"\n  [ERROR] YOLO weights not found: {yolo_path}\n")
             sys.exit(1)
@@ -406,256 +777,89 @@ def main():
         print(f"\n  [ERROR] Failed to load YOLO: {e}\n")
         sys.exit(1)
 
-    # ── MediaPipe ─────────────────────────────────────────────────────────────
+    # MediaPipe
     print("  Loading MediaPipe Face Mesh...")
     face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        max_num_faces=1, refine_landmarks=False,
+        min_detection_confidence=0.5, min_tracking_confidence=0.5,
     )
-
     transform = get_transform()
 
-    # ── Webcam ────────────────────────────────────────────────────────────────
+    # Camera
     print(f"\n  Opening camera {args.camera}...")
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print(f"  [ERROR] Cannot open camera index {args.camera}")
+        print(f"  [ERROR] Cannot open camera index {args.camera}\n")
         sys.exit(1)
 
-    # ── Calibration ───────────────────────────────────────────────────────────
-    if args.skip_calib:
-        ear_threshold     = args.ear_threshold
-        baseline_ear_open = ear_threshold / 0.5    # rough approximation
-        baseline_pitch    = 0.0
-        print(f"\n  [skip-calib]  EAR threshold = {ear_threshold:.3f}, pitch baseline = 0°\n")
+    # ── State machine ────────────────────────────────────────────────────────
+    state = STATE_STANDBY
+    ear_threshold     = None
+    baseline_ear_open = None
+    baseline_pitch    = None
+    calib_saved_at    = ""
+
+    # Try to load saved calibration
+    saved = load_calibration()
+    if saved is not None:
+        ear_threshold     = saved["ear_threshold"]
+        baseline_ear_open = saved["baseline_ear_open"]
+        baseline_pitch    = saved["baseline_pitch"]
+        calib_saved_at    = saved["saved_at"]
+        print(f"\n  Loaded calibration from {CALIB_FILE.name}")
+        print(f"     EAR threshold  : {ear_threshold:.4f}")
+        print(f"     Baseline open  : {baseline_ear_open:.4f}")
+        print(f"     Baseline pitch : {baseline_pitch:+.2f}°")
+        print(f"     Saved at       : {calib_saved_at}")
     else:
-        calib = run_calibration(cap, face_mesh)
-        if calib is None:
-            print("\n  Calibration aborted. Exiting.\n")
-            cap.release()
-            sys.exit(1)
-        ear_threshold, baseline_ear_open, baseline_pitch = calib
-
-    print("\n  Detection started. Press  q  to quit.\n")
-
-    # ── State ─────────────────────────────────────────────────────────────────
-    # Eye closure (sustained → microsleep)
-    closure_streak_start:    float | None = None
-    closure_already_counted: bool         = False
-    closure_events:          deque        = deque()
-    perclos_history:         deque        = deque()
-
-    # Yawn
-    yawn_streak_start:    float | None = None
-    yawn_already_counted: bool         = False
-    yawn_times:           deque        = deque()
-
-    # Nod
-    nod_streak_start:    float | None = None
-    nod_already_counted: bool         = False
-    nod_times:           deque        = deque()
-
-    # FPS
-    fps_counter, fps_t0, fps = 0, time.time(), 0.0
-
-    # Header
-    print(f"  {'Status':<11} {'Score':>6}  {'EAR':>14}  {'Yawn':>14}  "
-          f"{'Pitch':>7}  {'PCL':>5}  {'Y/30':>4}  {'N/30':>4}  {'C/30':>4}  {'FPS':>5}")
-    print("  " + "-" * 95)
+        print(f"\n  No saved calibration found.")
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("\n  [WARN] Empty frame — retrying...")
-                time.sleep(0.05)
-                continue
-
-            now = time.time()
-            fps_counter += 1
-            if fps_counter >= 15:
-                fps         = fps_counter / (now - fps_t0)
-                fps_counter = 0
-                fps_t0      = now
-
-            # Prune rolling windows
-            while yawn_times      and now - yawn_times[0]         > ROLLING_WINDOW_SEC:
-                yawn_times.popleft()
-            while nod_times       and now - nod_times[0]          > ROLLING_WINDOW_SEC:
-                nod_times.popleft()
-            while closure_events  and now - closure_events[0]     > ROLLING_WINDOW_SEC:
-                closure_events.popleft()
-            while perclos_history and now - perclos_history[0][0] > PERCLOS_WINDOW_SEC:
-                perclos_history.popleft()
-
-            # ── YOLO face detection ───────────────────────────────────────────
-            results    = yolo(frame, verbose=False, conf=FACE_CONF_MIN, imgsz=640)
-            detections = results[0].boxes
-
-            if detections is None or len(detections) == 0:
-                print(f"\r  {'[no face]':<11} {'—':>6}  {'—':>14}  {'—':>14}  "
-                      f"{'—':>7}  {'—':>5}  {'—':>4}  {'—':>4}  {'—':>4}  {fps:>4.1f}fps",
-                      end="", flush=True)
-                if not args.no_display:
-                    cv2.putText(frame, f"No face  FPS:{fps:.1f}", (10, 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_HUD, 1)
-                    cv2.imshow(WINDOW_NAME, frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
-                continue
-
-            # Largest face
-            boxes = detections.xyxy.cpu().numpy()
-            areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
-            best  = int(np.argmax(areas))
-            x1, y1, x2, y2 = map(int, boxes[best])
-            fh, fw = frame.shape[:2]
-            x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, fw, fh)
-
-            face_crop = frame[y1:y2, x1:x2]
-            m_crop    = mouth_crop(face_crop)
-
-            # ── MediaPipe (EAR + head pose) ───────────────────────────────────
-            mp_results = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            ear_val: float | None       = None
-            current_pitch: float | None = None
-            if mp_results.multi_face_landmarks:
-                lm = mp_results.multi_face_landmarks[0].landmark
-                ear_val       = compute_ear(lm, fw, fh)
-                current_pitch = estimate_pitch(lm, fw, fh)
-
-            # ── Eye closure state (binary, from threshold) ────────────────────
-            is_eyes_closed = (ear_val is not None and ear_val < ear_threshold)
-
-            # ── Sustained closure (microsleep) ────────────────────────────────
-            if is_eyes_closed:
-                if closure_streak_start is None:
-                    closure_streak_start    = now
-                    closure_already_counted = False
-                if (not closure_already_counted
-                        and now - closure_streak_start >= EYE_MIN_DURATION):
-                    closure_events.append(now)
-                    closure_already_counted = True
-            else:
-                closure_streak_start    = None
-                closure_already_counted = False
-            closure_count = len(closure_events)
-
-            # ── PERCLOS ───────────────────────────────────────────────────────
-            if ear_val is not None:
-                perclos_history.append((now, is_eyes_closed))
-            perclos = (sum(1 for _, c in perclos_history if c) / len(perclos_history)
-                       if perclos_history else 0.0)
-
-            # ── Eye signal for fusion (smooth interpolation) ──────────────────
-            # 0.0 when ear == baseline_open, 1.0 when ear == ear_threshold or below.
-            # Linear ramp between, clamped.
-            if ear_val is None:
-                eye_signal = 0.0
-            elif baseline_ear_open > ear_threshold:
-                eye_signal = float(np.clip(
-                    (baseline_ear_open - ear_val) / (baseline_ear_open - ear_threshold),
-                    0.0, 1.0,
-                ))
-            else:
-                eye_signal = 1.0 if is_eyes_closed else 0.0
-
-            # ── Yawn ──────────────────────────────────────────────────────────
-            yaw_label, yaw_conf = classify(yaw_model, yaw_cls, m_crop, transform)
-            yaw_prob = positive_prob(yaw_label, yaw_conf, "yawn")
-
-            is_mouth_open = yaw_label == "yawn" and yaw_conf >= YAWN_CONF_THRESHOLD
-            if is_mouth_open:
-                if yawn_streak_start is None:
-                    yawn_streak_start    = now
-                    yawn_already_counted = False
-                if (not yawn_already_counted
-                        and now - yawn_streak_start >= YAWN_MIN_DURATION):
-                    yawn_times.append(now)
-                    yawn_already_counted = True
-            else:
-                yawn_streak_start    = None
-                yawn_already_counted = False
-            yawn_count = len(yawn_times)
-
-            # ── Nod detection ─────────────────────────────────────────────────
-            nod_intensity = 0.0
-            is_head_down  = False
-            pitch_offset  = 0.0
-            if current_pitch is not None:
-                pitch_offset  = current_pitch - baseline_pitch
-                nod_intensity = min(abs(pitch_offset) / NOD_THRESHOLD_DEG, 1.0)
-                is_head_down  = abs(pitch_offset) >= NOD_THRESHOLD_DEG
-
-            if is_head_down:
-                if nod_streak_start is None:
-                    nod_streak_start    = now
-                    nod_already_counted = False
-                if (not nod_already_counted
-                        and now - nod_streak_start >= NOD_MIN_DURATION):
-                    nod_times.append(now)
-                    nod_already_counted = True
-            else:
-                nod_streak_start    = None
-                nod_already_counted = False
-            nod_count = len(nod_times)
-
-            # ── Fusion ────────────────────────────────────────────────────────
-            perclos_signal = min(perclos / PERCLOS_THRESHOLD, 1.0)
-            score = (W_EYE     * eye_signal
-                     + W_PERCLOS * perclos_signal
-                     + W_YAWN    * yaw_prob
-                     + W_NOD     * nod_intensity)
-            alert = score >= args.threshold
-
-            # ── Terminal output ───────────────────────────────────────────────
-            pitch_str = f"{pitch_offset:+5.1f}°"
-            ear_str   = f"{ear_val:.3f}" if ear_val is not None else "—"
-            eye_disp  = "CLOSED" if is_eyes_closed else "OPEN"
-
-            status = "🚨 ALERT  " if alert else "✅ OK     "
-            print(
-                f"\r  {status:<11} {score:>6.3f}  "
-                f"{ear_str:>5}/{eye_disp:>6}  "
-                f"{yaw_label:>8}({yaw_conf:.2f})  "
-                f"{pitch_str:>7}  "
-                f"{perclos*100:>4.1f}%  "
-                f"{yawn_count:>4d}  {nod_count:>4d}  {closure_count:>4d}  "
-                f"{fps:>4.1f}fps",
-                end="", flush=True,
-            )
-
-            if alert:
-                ts = time.strftime("%H:%M:%S")
-                print(
-                    f"\n  ┌─ V2X EVENT [{ts}] ────────────────────────────────────\n"
-                    f"  │  fatigue_score : {score:.4f}\n"
-                    f"  │  eye_signal    : {eye_signal:.4f}    "
-                    f"(EAR={ear_str}, threshold={ear_threshold:.3f}, closed={is_eyes_closed})\n"
-                    f"  │  perclos       : {perclos*100:.1f}%   "
-                    f"(threshold={PERCLOS_THRESHOLD*100:.0f}%)\n"
-                    f"  │  yawn_conf     : {yaw_label} @ {yaw_conf:.4f}\n"
-                    f"  │  pitch_offset  : {pitch_offset:+.2f}°  "
-                    f"(baseline={baseline_pitch:+.2f}°)\n"
-                    f"  │  events/{ROLLING_WINDOW_SEC}s   : "
-                    f"closures={closure_count}  yawns={yawn_count}  nods={nod_count}\n"
-                    f"  └─ ACTION        : BROADCAST WARNING TO SURROUNDING UNITS"
+            if state == STATE_STANDBY:
+                baseline_info = (
+                    {
+                        "ear_threshold":  ear_threshold,
+                        "baseline_pitch": baseline_pitch,
+                        "saved_at":       calib_saved_at,
+                    }
+                    if ear_threshold is not None else None
                 )
-
-            # ── Display ───────────────────────────────────────────────────────
-            if not args.no_display:
-                draw_overlay(frame, (x1, y1, x2, y2),
-                             ear_val, ear_threshold, is_eyes_closed,
-                             yaw_label, yaw_conf,
-                             score, yawn_count, nod_count, closure_count,
-                             perclos, pitch_str, alert)
-                cv2.putText(frame, f"FPS: {fps:.1f}", (fw - 100, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_HUD, 1)
-                cv2.imshow(WINDOW_NAME, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                nxt = run_standby(cap, has_calibration=(ear_threshold is not None),
+                                  baseline_info=baseline_info)
+                if nxt == "QUIT":
                     break
+                if nxt == "CALIBRATE":
+                    state = STATE_CALIBRATING
+                elif nxt == "PREDICT":
+                    state = STATE_PREDICTING
+
+            elif state == STATE_CALIBRATING:
+                calib = run_calibration(cap, face_mesh)
+                if calib is None:
+                    print("\n  Calibration aborted — returning to standby.\n")
+                    state = STATE_STANDBY
+                    continue
+                ear_threshold, baseline_ear_open, baseline_pitch = calib
+                # Persist
+                if save_calibration(ear_threshold, baseline_ear_open, baseline_pitch):
+                    calib_saved_at = time.strftime("%Y-%m-%d %H:%M:%S")
+                # After calibration → back to STANDBY (not predicting),
+                # user must explicitly press 'p' to start predicting.
+                state = STATE_STANDBY
+
+            elif state == STATE_PREDICTING:
+                nxt = run_prediction(
+                    cap, face_mesh, yolo, yaw_model, yaw_cls, transform,
+                    ear_threshold, baseline_ear_open, baseline_pitch,
+                    args.threshold, args.no_display,
+                )
+                if nxt == "QUIT":
+                    break
+                if nxt == "STANDBY":
+                    state = STATE_STANDBY
+                elif nxt == "RECALIBRATE":
+                    state = STATE_CALIBRATING
 
     except KeyboardInterrupt:
         print("\n\n  Interrupted by user.")
@@ -663,8 +867,7 @@ def main():
     finally:
         cap.release()
         face_mesh.close()
-        if not args.no_display:
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
         print("\n  Camera released. Bye!\n")
 
 
