@@ -14,6 +14,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 
 import mediapipe as mp
+from src.face_mesh_compat import FaceMeshCompat
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent
@@ -286,6 +287,21 @@ def estimate_pitch(landmarks, fw, fh):
     elif pitch_deg < -90:
         pitch_deg += 180
     return pitch_deg
+
+def make_face_mesh():
+    """Auto-pick API based on mediapipe version."""
+    try:
+        # Try legacy first (faster for older setups)
+        return mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1, refine_landmarks=False,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
+    except (AttributeError, ImportError):
+        return FaceMeshCompat(
+            model_path=BASE_DIR / "face_landmarker.task",
+            max_num_faces=1, refine_landmarks=False,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -779,10 +795,7 @@ def main():
 
     # MediaPipe
     print("  Loading MediaPipe Face Mesh...")
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1, refine_landmarks=False,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
-    )
+    face_mesh = make_face_mesh()
     transform = get_transform()
 
     # Camera

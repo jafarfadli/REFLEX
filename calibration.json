@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "ear_threshold": 0.2293706074954078,
-  "baseline_ear_open": 0.33346920249917567,
-  "baseline_pitch": -1.5568548104646993,
-  "saved_at": "2026-06-08 22:52:52",
+  "ear_threshold": 0.22927726344874858,
+  "baseline_ear_open": 0.32450702160078526,
+  "baseline_pitch": 8.591952125155728,
+  "saved_at": "2026-06-09 14:33:03",
   "platform": "Darwin"
 }

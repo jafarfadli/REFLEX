@@ -1,0 +1,15 @@
+{
+  "id": 4,
+  "label": "fatigue",
+  "duration_sec": 10.0,
+  "frame_count": 300,
+  "fps": 30.0,
+  "width": 1280,
+  "height": 720,
+  "recorded_at": "2026-06-09 12:06:02",
+  "calibration": {
+    "ear_threshold": 0.2806370634988054,
+    "baseline_ear_open": 0.35656710696103927,
+    "baseline_pitch": 6.1014316968352915
+  }
+}

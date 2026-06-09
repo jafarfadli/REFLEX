@@ -7,7 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
+from src.face_mesh_compat import FaceMeshCompat
 
 BASE_DIR    = Path(__file__).parent
 VIDEOS_DIR  = BASE_DIR / "validation_videos"
@@ -355,6 +355,22 @@ def save_clip(frames, fps, label, calibration):
     meta_p.write_text(json.dumps(metadata, indent=2))
     return video_p
 
+def make_face_mesh():
+    """Auto-pick API based on mediapipe version."""
+    import mediapipe as mp
+    try:
+        # Try legacy first (faster for older setups)
+        return mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1, refine_landmarks=False,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
+    except (AttributeError, ImportError):
+        return FaceMeshCompat(
+            model_path=BASE_DIR / "face_landmarker.task",
+            max_num_faces=1, refine_landmarks=False,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5,
+        )
+
 
 def main():
     print(f"\n{'='*60}\n  Record Validation Clips\n{'='*60}")
@@ -364,10 +380,7 @@ def main():
     if not cap.isOpened():
         print("  [ERROR] Cannot open camera"); sys.exit(1)
 
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1, refine_landmarks=False,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5,
-    )
+    face_mesh = make_face_mesh()
 
     calibration = load_calibration()
     if calibration:
