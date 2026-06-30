@@ -21,6 +21,7 @@ ALERT_THRESHOLD     = 0.65
 W_EYE, W_PERCLOS, W_YAWN, W_NOD = 0.35, 0.15, 0.20, 0.30
 EYE_MIN_DURATION    = 0.4
 PERCLOS_WINDOW_SEC  = 60
+PERCLOS_MIN_WINDOW_SEC  = 15
 PERCLOS_THRESHOLD   = 0.15
 YAWN_CONF_THRESHOLD = 0.70
 YAWN_MIN_DURATION   = 1.0
@@ -183,8 +184,13 @@ def process_video(video_path, metadata, yolo, yaw_model, yaw_cls, transform, fac
 
         if ear_val is not None:
             perclos_history.append((now, is_eyes_closed))
-        perclos = (sum(1 for _, c in perclos_history if c) / len(perclos_history)
-                   if perclos_history else 0.0)
+
+        # Only compute PERCLOS once window has enough history (avoids early saturation)
+        window_age = now - perclos_history[0][0] if perclos_history else 0.0
+        if window_age >= PERCLOS_MIN_WINDOW_SEC:
+            perclos = sum(1 for _, c in perclos_history if c) / len(perclos_history)
+        else:
+            perclos = 0.0
 
         if ear_val is None:
             eye_signal = 0.0
@@ -255,7 +261,7 @@ def main():
     yaw_model, yaw_cls = load_cnn(yaw_path)
 
     from ultralytics import YOLO
-    yolo_path = BASE_DIR / "yolo26n-face.pt"
+    yolo_path = BASE_DIR / "models" / "yolo26n-face.pt"
     if not yolo_path.exists():
         print(f"  [ERROR] {yolo_path} not found."); sys.exit(1)
     yolo = YOLO(str(yolo_path))
